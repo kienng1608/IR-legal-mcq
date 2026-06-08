@@ -1,0 +1,124 @@
+# =============================================================
+#  TRẮC NGHIỆM PHÁP LUẬT — TF-IDF (truy xuất gộp) | KHÔNG DL, KHÔNG pretrained
+#  Bản 57.91% + COVERAGE CÓ TRỌNG SỐ IDF (sửa điểm yếu stopword trong coverage).
+#
+#  Thay đổi DUY NHẤT so với bản gốc:
+#   - coverage cũ:  |phương_án ∩ văn_bản| / |phương_án|      (đếm thuần, stopword tính ngang)
+#   - coverage mới: Σ idf(t) [t ∈ cw∩doc] / Σ idf(t) [t ∈ cw]  (từ phổ biến bị hạ trọng số)
+#   - Bật/tắt bằng cờ IDF_COVERAGE để A/B trên leaderboard.
+# =============================================================
+import sklearn, numpy
+import re, json, numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from tqdm import tqdm
+
+CONTENT_TRUNC = 1500
+TOP_K = 90
+W_REL_OPT = 0.3
+W_SUB = 0.10
+MAXF = 300_000
+IDF_COVERAGE = True          # <<< True: coverage có trọng số IDF | False: như bản gốc 57.91%
+CHOICES = ["A", "B", "C", "D"]
+NEG_PATTERNS = ["không đúng", "không chính xác", "không phải", "không thuộc", "không bao gồm",
+    "không nằm trong", "không được phép", "không phù hợp", "ngoại trừ", "loại trừ",
+    "nào sai", "phát biểu sai", "ý nào sai", "điều nào sai", "đáp án nào sai",
+    "phương án nào sai", "khẳng định sai", "nhận định sai", "sai là"]
+
+def normalize(t): return re.sub(r"\s+", " ", str(t or "").lower().strip())
+def tokenize(t):  return re.findall(r"\w+", t, flags=re.UNICODE)
+def is_negation(q): return any(p in q for p in NEG_PATTERNS)
+def best_mean(v):
+    if v.size == 0: return 0.0
+    t3 = np.partition(v, -3)[-3:] if v.size > 3 else v
+    return 0.85 * float(t3.max()) + 0.15 * float(t3.mean())
+
+def load_corpus(corpus_file):
+    """Đọc corpus (JSONL/JSON array). Ghép title×2 + demuc + chude + content(cắt)."""
+    docs = []
+    with open(corpus_file, "r", encoding="utf-8") as f:
+        first = f.read(1); f.seek(0)
+        rows = json.load(f) if first == "[" else f
+        for d in rows:
+            if isinstance(d, str):
+                d = d.strip()
+                if not d: continue
+                try: d = json.loads(d)
+                except Exception: continue
+            ti = normalize(d.get("title", "")); de = normalize(d.get("demuc_name", ""))
+            ch = normalize(d.get("chude_name", "")); co = normalize(d.get("content", ""))[:CONTENT_TRUNC]
+            txt = f"{ti} {ti} {de} {ch} {co}".strip()
+            if txt: docs.append(txt)
+    return docs
+
+# ---- Tra cứu IDF cho TỪNG ĐƠN TỪ (unigram) ----------------------------------
+# vectorizer.idf_ chỉ phủ các từ trong từ vựng (đã lọc min_df). Từ hiếm ngoài
+# từ vựng -> gán idf cao nhất (vì hiếm = nhiều thông tin), khớp tinh thần IDF.
+def build_unigram_idf(vectorizer):
+    vocab = vectorizer.vocabulary_
+    idf = vectorizer.idf_
+    default_high = float(idf.max())
+    def idf_of(word):
+        j = vocab.get(word)
+        return float(idf[j]) if j is not None else default_high
+    return idf_of
+
+def answer_question(item, documents, vectorizer, doc_vectors, cache, idf_of):
+    qn = normalize(item.get("question", "")); ch = {c: normalize(item.get(c, "")) for c in CHOICES}
+    rt = " ".join([qn, qn] + [ch[c] for c in CHOICES]).strip()
+    sims = (doc_vectors @ vectorizer.transform([rt]).T).toarray().ravel()
+    k = min(TOP_K, sims.shape[0]); part = np.argpartition(sims, -k)[-k:]
+    pool = part[np.argsort(sims[part])][::-1]
+    pv = doc_vectors[pool]
+    qcos = (pv @ vectorizer.transform([qn]).T).toarray().ravel()
+    hyp = [f"{qn} {ch[c]} {ch[c]}".strip() for c in CHOICES]
+    hc = (pv @ vectorizer.transform(hyp).T).toarray().T          # (4, P)
+    for di in pool:
+        di = int(di)
+        if di not in cache: cache[di] = set(tokenize(documents[di]))
+    sc = []
+    for ci, c in enumerate(CHOICES):
+        ct = ch[c]
+        if not ct: sc.append(-1e9); continue
+        cw = set(tokenize(ct))
+        if not cw: sc.append(-1e9); continue
+
+        # Trọng số mỗi từ của phương án + tổng để chuẩn hóa coverage
+        if IDF_COVERAGE:
+            cw_w = {w: idf_of(w) for w in cw}            # idf cho từng từ
+            total_w = sum(cw_w.values()) or 1.0
+        else:
+            cw_w = {w: 1.0 for w in cw}                  # đếm thuần (bản gốc)
+            total_w = float(len(cw))
+
+        vals = np.empty(len(pool), np.float32)
+        for j, di in enumerate(pool):
+            di = int(di); rel = max(qcos[j], W_REL_OPT * hc[ci, j])
+            inter = cw & cache[di]
+            cov = (sum(cw_w[w] for w in inter) / total_w) if inter else 0.0
+            sub = 1.0 if ct in documents[di] else 0.0
+            vals[j] = rel * cov + W_SUB * rel * sub
+        sc.append(best_mean(vals))
+    return CHOICES[int(np.argmin(sc)) if is_negation(qn) else int(np.argmax(sc))]
+
+def make_submission(test_file, corpus_file, output_file="submission.json"):
+    documents = load_corpus(corpus_file)
+    print(f"Đã tải {len(documents)} điều luật. Đang xây dựng TF-IDF...")
+    vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=2, max_features=MAXF,
+        sublinear_tf=True, token_pattern=r"(?u)\w+", lowercase=True, dtype=np.float32)
+    doc_vectors = vectorizer.fit_transform(documents)            # L2-normalized -> dot = cosine
+    idf_of = build_unigram_idf(vectorizer)
+    print(f"TF-IDF: {doc_vectors.shape[0]} x {doc_vectors.shape[1]} — sẵn sàng. "
+          f"(IDF_COVERAGE={IDF_COVERAGE})")
+    with open(test_file, "r", encoding="utf-8") as f: test_data = json.load(f)
+    cache = {}; submissions = []
+    for item in tqdm(test_data):
+        submissions.append({"id": int(item.get("id")),
+                            "answer": answer_question(item, documents, vectorizer, doc_vectors, cache, idf_of)})
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(submissions, f, ensure_ascii=False, indent=2)
+    print(f"Đã ghi {len(submissions)} đáp án -> {output_file}")
+    return submissions
+
+
+if __name__ == "__main__":
+    make_submission("de_thi.json", "dataset.json")
