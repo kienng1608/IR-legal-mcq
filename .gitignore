@@ -1,0 +1,7 @@
+dataset*.json
+de_thi*.json
+submission.json
+submission.zip
+*.zip
+__pycache__/
+_*.py
