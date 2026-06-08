@@ -1,0 +1,229 @@
+# -*- coding: utf-8 -*-
+# =============================================================
+#  TRẮC NGHIỆM PHÁP LUẬT — HAI ENGINE TRONG MỘT FILE
+#  Chạy 1 lần -> sinh 2 bài nộp riêng:
+#     submission_tfidf.json / submission_tfidf.zip   (engine TF-IDF, bản 57.91%)
+#     submission_bm25.json  / submission_bm25.zip    (engine BM25 sparse + coverage)
+#
+#  KHÔNG dùng deep learning, KHÔNG dùng pretrained. Chỉ numpy/scipy/scikit-learn.
+#  Bạn tải cả 2 file ZIP về và nộp để so trên leaderboard.
+# =============================================================
+import os, re, json, zipfile, unicodedata
+from collections import Counter
+
+import numpy as np
+import scipy.sparse as sp
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **k): return x
+
+# ----------------------- THAM SỐ CHUNG -----------------------
+CONTENT_TRUNC = 1500
+NGRAM = (1, 2)
+MIN_DF = 2
+MAXF = 300_000
+CHOICES = ["A", "B", "C", "D"]
+NEG_PATTERNS = ["không đúng", "không chính xác", "không phải", "không thuộc", "không bao gồm",
+    "không nằm trong", "không được phép", "không phù hợp", "ngoại trừ", "loại trừ",
+    "nào sai", "phát biểu sai", "ý nào sai", "điều nào sai", "đáp án nào sai",
+    "phương án nào sai", "khẳng định sai", "nhận định sai", "sai là"]
+
+# Engine TF-IDF
+TFIDF_TOP_K = 90
+TFIDF_W_REL_OPT = 0.3
+TFIDF_W_SUB = 0.10
+TFIDF_IDF_COVERAGE = False   # False = đúng bản 57.91% đã xác nhận; True = coverage có IDF
+
+# Engine BM25
+BM25_K1 = 1.5
+BM25_B = 0.75
+BM25_TOP_K_EVIDENCE = 15
+
+
+# ----------------------- TIỀN XỬ LÝ --------------------------
+def normalize(t):
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(t or "")).lower().strip())
+
+def tokenize(t):
+    return re.findall(r"\w+", t, flags=re.UNICODE)
+
+def is_negation(q):
+    return any(p in q for p in NEG_PATTERNS)
+
+def best_mean(v):
+    if v.size == 0: return 0.0
+    t3 = np.partition(v, -3)[-3:] if v.size > 3 else v
+    return 0.85 * float(t3.max()) + 0.15 * float(t3.mean())
+
+
+# ----------------------- ĐỌC CORPUS (chung) ------------------
+def load_corpus(corpus_file):
+    """Mỗi văn bản = title×2 + demuc_name + chude_name + content(cắt). Hỗ trợ JSONL & JSON array."""
+    docs = []
+    with open(corpus_file, "r", encoding="utf-8") as f:
+        first = f.read(1); f.seek(0)
+        rows = json.load(f) if first == "[" else f
+        for d in rows:
+            if isinstance(d, str):
+                d = d.strip()
+                if not d: continue
+                try: d = json.loads(d)
+                except Exception: continue
+            ti = normalize(d.get("title", "")); de = normalize(d.get("demuc_name", ""))
+            ch = normalize(d.get("chude_name", "")); co = normalize(d.get("content", ""))[:CONTENT_TRUNC]
+            txt = f"{ti} {ti} {de} {ch} {co}".strip()
+            if txt: docs.append(txt)
+    return docs
+
+
+# =============================================================
+#  ENGINE 1 — TF-IDF (pipeline bản 57.91%)
+# =============================================================
+class TfidfEngine:
+    def __init__(self, documents):
+        self.docs = documents
+        self.vec = TfidfVectorizer(analyzer="word", ngram_range=NGRAM, min_df=MIN_DF,
+            max_features=MAXF, sublinear_tf=True, token_pattern=r"(?u)\w+",
+            lowercase=True, dtype=np.float32)
+        self.DV = self.vec.fit_transform(documents)         # L2 chuẩn hóa -> dot = cosine
+        self.cache = {}
+        vocab, idf = self.vec.vocabulary_, self.vec.idf_
+        self._idf, self._idf_hi = idf, float(idf.max())
+        self._vocab = vocab
+        print(f"[TF-IDF] {self.DV.shape[0]} x {self.DV.shape[1]} (IDF_COVERAGE={TFIDF_IDF_COVERAGE})")
+
+    def _idf_of(self, w):
+        j = self._vocab.get(w)
+        return float(self._idf[j]) if j is not None else self._idf_hi
+
+    def predict(self, item):
+        qn = normalize(item.get("question", "")); ch = {c: normalize(item.get(c, "")) for c in CHOICES}
+        rt = " ".join([qn, qn] + [ch[c] for c in CHOICES]).strip()
+        sims = (self.DV @ self.vec.transform([rt]).T).toarray().ravel()
+        k = min(TFIDF_TOP_K, sims.shape[0]); part = np.argpartition(sims, -k)[-k:]
+        pool = part[np.argsort(sims[part])][::-1]
+        pv = self.DV[pool]
+        qcos = (pv @ self.vec.transform([qn]).T).toarray().ravel()
+        hyp = [f"{qn} {ch[c]} {ch[c]}".strip() for c in CHOICES]
+        hc = (pv @ self.vec.transform(hyp).T).toarray().T
+        for di in pool:
+            di = int(di)
+            if di not in self.cache: self.cache[di] = set(tokenize(self.docs[di]))
+        sc = []
+        for ci, c in enumerate(CHOICES):
+            ct = ch[c]
+            if not ct: sc.append(-1e9); continue
+            cw = set(tokenize(ct))
+            if not cw: sc.append(-1e9); continue
+            if TFIDF_IDF_COVERAGE:
+                cw_w = {w: self._idf_of(w) for w in cw}; tot = sum(cw_w.values()) or 1.0
+            else:
+                cw_w = {w: 1.0 for w in cw}; tot = float(len(cw))
+            vals = np.empty(len(pool), np.float32)
+            for j, di in enumerate(pool):
+                di = int(di); rel = max(qcos[j], TFIDF_W_REL_OPT * hc[ci, j])
+                inter = cw & self.cache[di]
+                cov = (sum(cw_w[w] for w in inter) / tot) if inter else 0.0
+                sub = 1.0 if ct in self.docs[di] else 0.0
+                vals[j] = rel * cov + TFIDF_W_SUB * rel * sub
+            sc.append(best_mean(vals))
+        return CHOICES[int(np.argmin(sc)) if is_negation(qn) else int(np.argmax(sc))]
+
+
+# =============================================================
+#  ENGINE 2 — BM25 thưa + coverage có trọng số IDF
+# =============================================================
+class Bm25Engine:
+    def __init__(self, documents):
+        self.cv = CountVectorizer(analyzer="word", ngram_range=NGRAM, min_df=MIN_DF,
+            max_features=MAXF, token_pattern=r"(?u)\w+", lowercase=True)
+        X = self.cv.fit_transform(documents).tocsr().astype(np.float32)
+        n_docs = X.shape[0]
+        dl = np.asarray(X.sum(axis=1)).flatten(); avgdl = dl.mean() if n_docs else 1.0
+        df = np.asarray((X > 0).sum(axis=0)).flatten()
+        self.idf = np.log((n_docs - df + 0.5) / (df + 0.5) + 1).astype(np.float32)
+        rows = np.repeat(np.arange(n_docs), np.diff(X.indptr)); cols = X.indices; tf = X.data
+        denom = tf + BM25_K1 * (1 - BM25_B + BM25_B * dl[rows] / avgdl)
+        w = self.idf[cols] * (tf * (BM25_K1 + 1)) / denom
+        self.W = sp.csr_matrix((w, X.indices, X.indptr), shape=X.shape).astype(np.float32)
+        self.Wt = self.W.T.tocsr()
+        self.Xb = (X > 0).astype(np.float32)
+        self.n_docs = n_docs
+        print(f"[BM25]  {n_docs} x {X.shape[1]} ({self.W.nnz:,} nz)")
+
+    def question_scores(self, texts):
+        return np.asarray((self.cv.transform(texts) @ self.Wt).todense())
+
+    def predict(self, item, qrel):
+        k = min(BM25_TOP_K_EVIDENCE, self.n_docs)
+        top = np.argpartition(qrel, -k)[-k:]; w = qrel[top].copy()
+        if w.sum() <= 0: w = np.ones_like(w)
+        Cv = self.cv.transform([item.get(c, "") for c in CHOICES])
+        evi = np.asarray((w[None, :] @ self.Xb[top])).flatten()
+        cov = np.zeros(4, dtype=np.float32)
+        for ci in range(4):
+            ids = Cv[ci].indices
+            if len(ids) == 0: continue
+            cov[ci] = (self.idf[ids] * np.minimum(evi[ids], 1.0)).sum() / (self.idf[ids].sum() + 1e-9)
+        q = item.get("question", "")
+        return CHOICES[int(np.argmin(cov)) if is_negation(normalize(q)) else int(np.argmax(cov))]
+
+
+# =============================================================
+#  ĐÓNG GÓI & PIPELINE
+# =============================================================
+def _write_and_zip(submissions, json_path, zip_path):
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(submissions, f, ensure_ascii=False, indent=2)
+    try:
+        script = __file__
+    except NameError:
+        script = None
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(json_path, arcname="submission.json")     # tên chuẩn theo đề bài
+        if script and os.path.exists(script):
+            z.write(script, arcname=os.path.basename(script))
+        else:
+            print(f"  (Lưu ý: chạy notebook -> tự thêm file code vào {os.path.basename(zip_path)} trước khi nộp)")
+    dist = dict(sorted(Counter(s["answer"] for s in submissions).items()))
+    print(f"  -> {json_path} | {zip_path} | phân bố: {dist}")
+
+
+def make_submissions(test_file, corpus_file, out_dir="."):
+    documents = load_corpus(corpus_file)
+    print(f"Đã tải {len(documents)} điều luật.\n")
+    with open(test_file, "r", encoding="utf-8") as f:
+        test_data = json.load(f)
+
+    # ---- Engine 1: TF-IDF ----
+    print("Xây dựng & chạy engine TF-IDF...")
+    tf = TfidfEngine(documents)
+    sub_tf = [{"id": int(it.get("id")), "answer": tf.predict(it)} for it in tqdm(test_data)]
+    _write_and_zip(sub_tf, os.path.join(out_dir, "submission_tfidf.json"),
+                   os.path.join(out_dir, "submission_tfidf.zip"))
+
+    # ---- Engine 2: BM25 ----
+    print("\nXây dựng & chạy engine BM25...")
+    bm = Bm25Engine(documents)
+    SQ = bm.question_scores([it.get("question", "") for it in test_data])
+    sub_bm = [{"id": int(it.get("id")), "answer": bm.predict(it, SQ[i])}
+              for i, it in enumerate(tqdm(test_data))]
+    _write_and_zip(sub_bm, os.path.join(out_dir, "submission_bm25.json"),
+                   os.path.join(out_dir, "submission_bm25.zip"))
+
+    print("\nXong. Tải cả 2 file ZIP và nộp để so điểm trên leaderboard.")
+
+
+if __name__ == "__main__":
+    # File mặc định nằm cùng thư mục chạy
+    make_submissions("de_thi.json", "dataset.json")
+
+    # VSCode (đường dẫn theo vị trí script):
+    # import os; BASE = os.path.dirname(os.path.abspath(__file__))
+    # make_submissions(os.path.join(BASE,"data","de_thi.json"), os.path.join(BASE,"data","dataset.json"), out_dir=BASE)
+
+    # Google Colab:
+    # make_submissions("/content/drive/MyDrive/data/de_thi.json", "/content/drive/MyDrive/data/dataset.json")
